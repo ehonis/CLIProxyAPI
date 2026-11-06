@@ -212,6 +212,10 @@ func (h *Handler) APICall(c *gin.Context) {
 	httpClient := &http.Client{
 		Timeout: defaultAPICallTimeout,
 	}
+	// A scoped key's call goes to the URL it was allowed and nowhere else.
+	if _, scoped := c.Get(scopedKeyContextKey); scoped {
+		httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
 	httpClient.Transport = h.apiCallTransport(auth, requestProxyURL)
 
 	resp, errDo := httpClient.Do(req)

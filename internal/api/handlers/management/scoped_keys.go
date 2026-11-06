@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // Scoped management keys (management.scoped-keys) let another program manage
@@ -45,6 +46,11 @@ var scopedKeyForbiddenPrefixes = []string{
 	"/v0/management/api-keys",
 }
 
+const scopedKeyRoutePrefix = "/v8/management/"
+
+// The credential fields a scoped key may set, by canonical root name.
+var scopedAllowedFields = map[string]bool{"note": true, "priority": true, "weight": true, "websockets": true}
+
 // matchScopedKey returns the scoped key whose hash matches provided, or nil.
 func matchScopedKey(cfg *config.Config, provided string) *config.ManagementScopedKey {
 	if cfg == nil || provided == "" {
@@ -68,6 +74,10 @@ func matchScopedKey(cfg *config.Config, provided string) *config.ManagementScope
 }
 
 func scopedRouteForbidden(path string) bool {
+	// Scoped keys speak the v8 API only; v0 has config and log routes under other names.
+	if !strings.HasPrefix(path, scopedKeyRoutePrefix) {
+		return true
+	}
 	for _, prefix := range scopedKeyForbiddenPrefixes {
 		if path == prefix || strings.HasPrefix(path, prefix+"/") || strings.HasPrefix(path, prefix+".") {
 			return true
@@ -168,15 +178,26 @@ func checkScopedAPICall(c *gin.Context, key *config.ManagementScopedKey) (bool, 
 	if strings.TrimSpace(body.ProxyURL) != "" {
 		return false, "scoped key: api-call may not set proxy_url"
 	}
+	// The token may only travel as the Authorization header to the allowed URL:
+	// not in the body (an upstream error can echo it), not in another header, and
+	// not to another virtual host on the same edge.
+	if strings.Contains(body.Data, "$TOKEN$") {
+		return false, "scoped key: api-call may not put the token in the body"
+	}
+	for name, value := range body.Header {
+		key := strings.TrimSpace(name)
+		if strings.EqualFold(key, "host") {
+			return false, "scoped key: api-call may not set Host"
+		}
+		if strings.Contains(value, "$TOKEN$") && !strings.EqualFold(key, "authorization") {
+			return false, "scoped key: api-call may put the token only in Authorization"
+		}
+	}
 	if !scopedAPICallURLAllowed(key, body.URL) {
 		return false, "scoped key: api-call URL not allowed"
 	}
 	return true, ""
 }
-
-// Credential fields a scoped key may not set: where a login's traffic goes and
-// what is sent with it.
-var scopedForbiddenFields = []string{"proxy_url", "proxy-url", "headers", "base_url", "base-url"}
 
 func checkScopedFieldsPatch(c *gin.Context) (bool, string) {
 	if c.Request.Body == nil {
@@ -192,11 +213,16 @@ func checkScopedFieldsPatch(c *gin.Context) (bool, string) {
 	if errDecode := json.Unmarshal(raw, &body); errDecode != nil {
 		return false, "scoped key: body is not a JSON object"
 	}
+	// Judged on the names the handler will use: trimmed, aliases folded, nesting kept.
 	for name := range body {
-		for _, forbidden := range scopedForbiddenFields {
-			if strings.EqualFold(name, forbidden) {
-				return false, "scoped key: may not set " + forbidden
-			}
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "name" || trimmed == "auth_index" {
+			continue
+		}
+		root, rest, nested := strings.Cut(trimmed, ".")
+		canonical := coreauth.CanonicalCredentialMetadataKey(strings.TrimSpace(root))
+		if nested || rest != "" || !scopedAllowedFields[canonical] {
+			return false, "scoped key: may not set " + trimmed
 		}
 	}
 	return true, ""

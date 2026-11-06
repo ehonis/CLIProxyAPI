@@ -26,6 +26,8 @@ func scopedTestHandler(t *testing.T, allowRemote bool) (*Handler, string) {
 			"GET /v8/management/credentials",
 			"POST /v8/management/requests/api-call",
 			"PATCH /v8/management/credentials/fields",
+			// Listed, but v0 is never reachable with a scoped key.
+			"PUT /v0/management/proxy-url",
 			// Listed, but forbidden for every scoped key.
 			"GET /v8/management/credentials/download",
 			"GET /v8/management/config",
@@ -53,6 +55,9 @@ func scopedEngine(h *Handler) *gin.Engine {
 	group.GET("/config", echo)
 	group.POST("/requests/api-call", echo)
 	group.PATCH("/credentials/fields", echo)
+	legacy := engine.Group("/v0/management")
+	legacy.Use(h.Middleware())
+	legacy.PUT("/proxy-url", echo)
 	return engine
 }
 
@@ -107,6 +112,10 @@ func TestScopedKeyAPICallURLs(t *testing.T) {
 		// Duplicate keys: encoding/json keeps the last, for the check and the handler alike.
 		{`{"url":"https://api.anthropic.com/api/oauth/usage","url":"https://evil.example.com/"}`, http.StatusForbidden},
 		{`not json`, http.StatusForbidden},
+		{`{"url":"https://api.anthropic.com/api/oauth/usage","header":{"Authorization":"Bearer $TOKEN$"}}`, http.StatusOK},
+		{`{"url":"https://api.anthropic.com/api/oauth/usage","data":"{\"t\":\"$TOKEN$\"}"}`, http.StatusForbidden},
+		{`{"url":"https://api.anthropic.com/api/oauth/usage","header":{"X-Echo":"$TOKEN$"}}`, http.StatusForbidden},
+		{`{"url":"https://api.anthropic.com/api/oauth/usage","header":{" host ":"evil.example.com"}}`, http.StatusForbidden},
 	}
 	for _, tc := range cases {
 		rec := scopedDo(engine, http.MethodPost, "/v8/management/requests/api-call", key, tc.body, local)
@@ -126,13 +135,42 @@ func TestScopedKeyFieldsAndRemote(t *testing.T) {
 	if rec := scopedDo(engine, http.MethodPatch, "/v8/management/credentials/fields", key, `{"name":"a.json","priority":2}`, local); rec.Code != http.StatusOK {
 		t.Fatalf("plain fields: %d", rec.Code)
 	}
-	if rec := scopedDo(engine, http.MethodPatch, "/v8/management/credentials/fields", key, `{"name":"a.json","Proxy_URL":"socks5://x"}`, local); rec.Code != http.StatusForbidden {
-		t.Fatalf("proxy_url must be refused: %d", rec.Code)
+	for _, body := range []string{
+		`{"name":"a.json","Proxy_URL":"socks5://x"}`,
+		`{"name":"a.json"," proxy_url":"socks5://x"}`,
+		`{"name":"a.json","headers.X-Foo":"v"}`,
+		`{"name":"a.json","note.x":"v"}`,
+		`{"name":"a.json","prefix":"x"}`,
+	} {
+		if rec := scopedDo(engine, http.MethodPatch, "/v8/management/credentials/fields", key, body, local); rec.Code != http.StatusForbidden {
+			t.Fatalf("%s must be refused: %d", body, rec.Code)
+		}
+	}
+	if rec := scopedDo(engine, http.MethodPut, "/v0/management/proxy-url", key, `{"value":"x"}`, local); rec.Code != http.StatusForbidden {
+		t.Fatalf("v0 must be refused for a scoped key: %d", rec.Code)
 	}
 	if rec := scopedDo(engine, http.MethodGet, "/v8/management/credentials", key, "", "100.64.0.9:1234"); rec.Code != http.StatusForbidden {
 		t.Fatalf("remote with allow-remote off: %d", rec.Code)
 	}
 	if rec := scopedDo(engine, http.MethodGet, "/v8/management/credentials", "not-a-key", "", local); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong key: %d", rec.Code)
+	}
+}
+
+func TestScopedKeyRefreshHidesCredential(t *testing.T) {
+	h, key := scopedTestHandler(t, true)
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	group := engine.Group("/v8/management")
+	group.Use(h.Middleware())
+	group.GET("/credentials", func(c *gin.Context) {
+		_, scoped := c.Get(scopedKeyContextKey)
+		c.JSON(http.StatusOK, gin.H{"scoped": scoped})
+	})
+	if rec := scopedDo(engine, http.MethodGet, "/v8/management/credentials", key, "", "127.0.0.1:1"); !strings.Contains(rec.Body.String(), `"scoped":true`) {
+		t.Fatalf("a scoped request must be marked for handlers: %s", rec.Body.String())
+	}
+	if rec := scopedDo(engine, http.MethodGet, "/v8/management/credentials", "root-secret", "", "127.0.0.1:1"); !strings.Contains(rec.Body.String(), `"scoped":false`) {
+		t.Fatalf("a root request must not be marked: %s", rec.Body.String())
 	}
 }
