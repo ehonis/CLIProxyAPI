@@ -161,6 +161,54 @@ func TestScopedKeyFieldsAndRemote(t *testing.T) {
 	}
 }
 
+func TestScopedKeySnapshotStaysStableAfterConfigReload(t *testing.T) {
+	h, key := scopedTestHandler(t, false)
+	engine := scopedEngine(h)
+
+	// Remote is off in this config, so a non-loopback client is refused.
+	if rec := scopedDo(engine, http.MethodGet, "/v8/management/credentials", key, "", "100.64.0.9:1234"); rec.Code != http.StatusForbidden {
+		t.Fatalf("remote request must stay forbidden: %d %s", rec.Code, rec.Body.String())
+	}
+
+	snap, allowRemote, ok := h.snapshotScopedKey(key)
+	if !ok || allowRemote || len(snap.Routes) == 0 {
+		t.Fatalf("snapshot = ok:%v allowRemote:%v routes:%v", ok, allowRemote, snap.Routes)
+	}
+	// A management save can rewrite the live struct while a request still holds
+	// its snapshot. The copied routes and the copied remote flag must not follow.
+	h.cfg.RemoteManagement.AllowRemote = true
+	h.cfg.RemoteManagement.ScopedKeys[0].Routes[0] = "DELETE /v8/management/credentials"
+	if allowRemote {
+		t.Fatal("snapshot remote flag followed the live config")
+	}
+	if snap.Routes[0] != "GET /v8/management/credentials" {
+		t.Fatal("snapshot routes alias the live slice")
+	}
+
+	// Authorization must use that snapshot. The live config now allows remote,
+	// but the snapshot still says it does not.
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v8/management/credentials", nil)
+	c.Request.RemoteAddr = "100.64.0.9:1234"
+	if h.authorizeScopedKey(c, snap, allowRemote, false) {
+		t.Fatal("authorizeScopedKey used the live allow-remote flag instead of the snapshot")
+	}
+	// FullPath is empty on a bare test context, so a remote check that trusted
+	// the live config would fail later with "route not allowed". The snapshot
+	// flag must refuse the request as remote management instead.
+	if !strings.Contains(rec.Body.String(), "remote management disabled") {
+		t.Fatalf("snapshot must refuse remote access, got %s", rec.Body.String())
+	}
+
+	// The next request reads the rewritten config: the listed route is now DELETE,
+	// so GET is refused even from localhost.
+	if rec := scopedDo(engine, http.MethodGet, "/v8/management/credentials", key, "", "127.0.0.1:1234"); rec.Code != http.StatusForbidden {
+		t.Fatalf("request after reload must see the new routes: %d", rec.Code)
+	}
+}
+
 func TestScopedKeyRefreshHidesCredential(t *testing.T) {
 	h, key := scopedTestHandler(t, true)
 	gin.SetMode(gin.TestMode)

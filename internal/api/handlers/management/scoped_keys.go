@@ -240,20 +240,47 @@ func (h *Handler) clientBanned(clientIP string) bool {
 	return ai != nil && !ai.blockedUntil.IsZero() && time.Now().Before(ai.blockedUntil)
 }
 
+// snapshotScopedKey copies the matching key and the remote-access flag while
+// holding h.mu. The copy is what this request is allowed to do. A later
+// SetConfig, or a save that mutates the live slices, cannot change it, and the
+// key's routes cannot come from a different config generation than allowRemote.
+func (h *Handler) snapshotScopedKey(provided string) (key config.ManagementScopedKey, allowRemote bool, ok bool) {
+	if h == nil {
+		return config.ManagementScopedKey{}, false, false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	matched := matchScopedKey(h.cfg, provided)
+	if matched == nil {
+		return config.ManagementScopedKey{}, false, false
+	}
+	key = *matched
+	// Routes and URL patterns are slices. Copy them so a config save that
+	// reuses or appends to the live backing array cannot change this request.
+	key.Routes = append([]string(nil), matched.Routes...)
+	key.APICallURLs = append([]string(nil), matched.APICallURLs...)
+	if h.cfg != nil {
+		allowRemote = h.cfg.RemoteManagement.AllowRemote
+	}
+	return key, allowRemote, true
+}
+
 // authorizeScopedKey runs for a request carrying a scoped key. It applies the
-// same remote rule as the root key and then the key's own scope.
-func (h *Handler) authorizeScopedKey(c *gin.Context, key *config.ManagementScopedKey, localClient bool) bool {
+// same remote rule as the root key and then the key's own scope. allowRemote
+// is the flag from the same snapshot as key; this function does not read h.cfg.
+func (h *Handler) authorizeScopedKey(c *gin.Context, key config.ManagementScopedKey, allowRemote, localClient bool) bool {
 	if h.clientBanned(c.ClientIP()) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "IP banned due to too many failed attempts"})
 		return false
 	}
-	allowRemote := h.allowRemoteOverride || (h.cfg != nil && h.cfg.RemoteManagement.AllowRemote)
+	// A test or embedder can force remote management on without rewriting config.
+	allowRemote = h.allowRemoteOverride || allowRemote
 	if !localClient && !allowRemote {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
 		return false
 	}
 	fullPath := c.FullPath()
-	if !scopedRouteAllowed(key, c.Request.Method, fullPath) {
+	if !scopedRouteAllowed(&key, c.Request.Method, fullPath) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "scoped key: route not allowed"})
 		return false
 	}
@@ -264,7 +291,7 @@ func (h *Handler) authorizeScopedKey(c *gin.Context, key *config.ManagementScope
 		}
 	}
 	if strings.HasSuffix(fullPath, "/requests/api-call") || strings.HasSuffix(fullPath, "/api-call") {
-		if ok, msg := checkScopedAPICall(c, key); !ok {
+		if ok, msg := checkScopedAPICall(c, &key); !ok {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": msg})
 			return false
 		}

@@ -347,8 +347,12 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			provided = c.GetHeader("X-Management-Key")
 		}
 
-		if key := matchScopedKey(h.cfg, provided); key != nil {
-			if h.authorizeScopedKey(c, key, localClient) {
+		// One snapshot: the key's routes and the remote-access flag must come from
+		// the same config. A reload can replace h.cfg between two unlocked reads,
+		// and authorizing a new key under an old remote policy (or the reverse)
+		// would widen or drop access for this request.
+		if key, allowRemote, ok := h.snapshotScopedKey(provided); ok {
+			if h.authorizeScopedKey(c, key, allowRemote, localClient) {
 				c.Next()
 			}
 			return
