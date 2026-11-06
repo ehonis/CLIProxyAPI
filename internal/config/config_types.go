@@ -331,6 +331,21 @@ type RemoteManagement struct {
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
 	// BaseURL specifies the base URL of the remote management API for TUI client mode (e.g. "https://proxy.example.com").
 	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+	// ScopedKeys are extra management keys limited to listed routes and api-call URLs.
+	ScopedKeys []ManagementScopedKey `yaml:"scoped-keys,omitempty" json:"scoped-keys,omitempty"`
+}
+
+// ManagementScopedKey is a management key that reaches only what it lists. It can
+// never read or change the config, download a credential, touch plugins or read logs.
+type ManagementScopedKey struct {
+	// Name identifies the key in logs.
+	Name string `yaml:"name" json:"name"`
+	// KeySHA256 is the lowercase hex SHA-256 of the key's value.
+	KeySHA256 string `yaml:"key-sha256" json:"key-sha256"`
+	// Routes lists "METHOD /route/pattern" entries, as registered in the router.
+	Routes []string `yaml:"routes,omitempty" json:"routes,omitempty"`
+	// APICallURLs lists the upstream URLs api-call may target; "*" matches one path segment.
+	APICallURLs []string `yaml:"api-call-urls,omitempty" json:"api-call-urls,omitempty"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.

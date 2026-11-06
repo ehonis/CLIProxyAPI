@@ -289,6 +289,13 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			provided = c.GetHeader("X-Management-Key")
 		}
 
+		if key := matchScopedKey(h.cfg, provided); key != nil {
+			if h.authorizeScopedKey(c, key, localClient) {
+				c.Next()
+			}
+			return
+		}
+
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
 		if !allowed {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
