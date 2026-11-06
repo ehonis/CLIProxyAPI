@@ -69,6 +69,11 @@ func (h *Handler) RefreshAuthFiles(c *gin.Context) {
 		return
 	}
 
+	// A scoped key never sees the refreshed credential: it holds the new tokens.
+	if _, scoped := c.Get(scopedKeyContextKey); scoped {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"ok":   true,
 		"auth": refreshed,

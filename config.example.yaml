@@ -67,6 +67,25 @@ management:
   # Leave empty to disable the Management API entirely (404 for /v0/management and /v8/management routes).
   secret-key: ""
 
+  # Scoped management keys: extra keys for another program (a dashboard, a bot) that
+  # reach only the routes they list. api-call with a scoped key may only target the
+  # listed URLs ("*" matches one path segment; a query must match exactly) and may
+  # not set proxy_url. Whatever a scoped key lists, it can never read or change the
+  # config, download a credential, touch plugins or read logs, and credential field
+  # edits may not set proxy_url or headers. key-sha256 is the hex SHA-256 of the
+  # key: generate one with `openssl rand -hex 32` and hash it with
+  # `printf %s "$KEY" | sha256sum`. Routes are "METHOD /route/pattern" as registered.
+  # scoped-keys:
+  #   - name: dashboard
+  #     key-sha256: "<64 hex characters>"
+  #     routes:
+  #       - "GET /v8/management/credentials"
+  #       - "PATCH /v8/management/credentials/status"
+  #       - "POST /v8/management/requests/api-call"
+  #     api-call-urls:
+  #       - "https://api.anthropic.com/api/oauth/usage"
+  #       - "https://chatgpt.com/backend-api/wham/usage"
+
   # Disable the bundled management control panel asset download and HTTP route when true.
   disable-control-panel: false
 
