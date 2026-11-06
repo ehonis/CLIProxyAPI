@@ -178,6 +178,10 @@ func checkScopedAPICall(c *gin.Context, key *config.ManagementScopedKey) (bool, 
 	if strings.TrimSpace(body.ProxyURL) != "" {
 		return false, "scoped key: api-call may not set proxy_url"
 	}
+	// GET and POST are all a usage read or a claim needs; TRACE would echo the token.
+	if method := strings.ToUpper(strings.TrimSpace(body.Method)); method != http.MethodGet && method != http.MethodPost {
+		return false, "scoped key: api-call method must be GET or POST"
+	}
 	// The token may only travel as the Authorization header to the allowed URL:
 	// not in the body (an upstream error can echo it), not in another header, and
 	// not to another virtual host on the same edge.
@@ -215,10 +219,11 @@ func checkScopedFieldsPatch(c *gin.Context) (bool, string) {
 	}
 	// Judged on the names the handler will use: trimmed, aliases folded, nesting kept.
 	for name := range body {
-		trimmed := strings.TrimSpace(name)
-		if trimmed == "name" || trimmed == "auth_index" {
+		// The handler deletes only the exact "name" key; anything else it writes.
+		if name == "name" {
 			continue
 		}
+		trimmed := strings.TrimSpace(name)
 		root, rest, nested := strings.Cut(trimmed, ".")
 		canonical := coreauth.CanonicalCredentialMetadataKey(strings.TrimSpace(root))
 		if nested || rest != "" || !scopedAllowedFields[canonical] {

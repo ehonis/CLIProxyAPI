@@ -3,6 +3,7 @@ package management
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -101,21 +102,22 @@ func TestScopedKeyAPICallURLs(t *testing.T) {
 		want int
 	}{
 		{`{"authIndex":"a","method":"GET","url":"https://api.anthropic.com/api/oauth/usage"}`, http.StatusOK},
+		{`{"authIndex":"a","method":"TRACE","url":"https://api.anthropic.com/api/oauth/usage"}`, http.StatusForbidden},
 		{`{"authIndex":"a","method":"POST","url":"https://api.anthropic.com/api/organizations/0f0e/reset_rate_limits"}`, http.StatusOK},
-		{`{"authIndex":"a","url":"https://api.anthropic.com/api/oauth/usage?x=1"}`, http.StatusForbidden},
-		{`{"authIndex":"a","url":"https://evil.example.com/api/oauth/usage"}`, http.StatusForbidden},
-		{`{"authIndex":"a","url":"http://api.anthropic.com/api/oauth/usage"}`, http.StatusForbidden},
-		{`{"authIndex":"a","url":"https://user@api.anthropic.com/api/oauth/usage"}`, http.StatusForbidden},
-		{`{"authIndex":"a","url":"https://api.anthropic.com/api/organizations/../oauth/reset_rate_limits"}`, http.StatusForbidden},
-		{`{"authIndex":"a","url":"https://api.anthropic.com/api/organizations/x/y/reset_rate_limits"}`, http.StatusForbidden},
-		{`{"authIndex":"a","url":"https://api.anthropic.com/api/oauth/usage","proxy_url":"http://evil.example.com:8080"}`, http.StatusForbidden},
+		{`{"authIndex":"a","method":"GET","url":"https://api.anthropic.com/api/oauth/usage?x=1"}`, http.StatusForbidden},
+		{`{"authIndex":"a","method":"GET","url":"https://evil.example.com/api/oauth/usage"}`, http.StatusForbidden},
+		{`{"authIndex":"a","method":"GET","url":"http://api.anthropic.com/api/oauth/usage"}`, http.StatusForbidden},
+		{`{"authIndex":"a","method":"GET","url":"https://user@api.anthropic.com/api/oauth/usage"}`, http.StatusForbidden},
+		{`{"authIndex":"a","method":"GET","url":"https://api.anthropic.com/api/organizations/../oauth/reset_rate_limits"}`, http.StatusForbidden},
+		{`{"authIndex":"a","method":"GET","url":"https://api.anthropic.com/api/organizations/x/y/reset_rate_limits"}`, http.StatusForbidden},
+		{`{"authIndex":"a","method":"GET","url":"https://api.anthropic.com/api/oauth/usage","proxy_url":"http://evil.example.com:8080"}`, http.StatusForbidden},
 		// Duplicate keys: encoding/json keeps the last, for the check and the handler alike.
-		{`{"url":"https://api.anthropic.com/api/oauth/usage","url":"https://evil.example.com/"}`, http.StatusForbidden},
+		{`{"method":"GET","url":"https://api.anthropic.com/api/oauth/usage","url":"https://evil.example.com/"}`, http.StatusForbidden},
 		{`not json`, http.StatusForbidden},
-		{`{"url":"https://api.anthropic.com/api/oauth/usage","header":{"Authorization":"Bearer $TOKEN$"}}`, http.StatusOK},
-		{`{"url":"https://api.anthropic.com/api/oauth/usage","data":"{\"t\":\"$TOKEN$\"}"}`, http.StatusForbidden},
-		{`{"url":"https://api.anthropic.com/api/oauth/usage","header":{"X-Echo":"$TOKEN$"}}`, http.StatusForbidden},
-		{`{"url":"https://api.anthropic.com/api/oauth/usage","header":{" host ":"evil.example.com"}}`, http.StatusForbidden},
+		{`{"method":"GET","url":"https://api.anthropic.com/api/oauth/usage","header":{"Authorization":"Bearer $TOKEN$"}}`, http.StatusOK},
+		{`{"method":"GET","url":"https://api.anthropic.com/api/oauth/usage","data":"{\"t\":\"$TOKEN$\"}"}`, http.StatusForbidden},
+		{`{"method":"GET","url":"https://api.anthropic.com/api/oauth/usage","header":{"X-Echo":"$TOKEN$"}}`, http.StatusForbidden},
+		{`{"method":"GET","url":"https://api.anthropic.com/api/oauth/usage","header":{" host ":"evil.example.com"}}`, http.StatusForbidden},
 	}
 	for _, tc := range cases {
 		rec := scopedDo(engine, http.MethodPost, "/v8/management/requests/api-call", key, tc.body, local)
@@ -141,6 +143,8 @@ func TestScopedKeyFieldsAndRemote(t *testing.T) {
 		`{"name":"a.json","headers.X-Foo":"v"}`,
 		`{"name":"a.json","note.x":"v"}`,
 		`{"name":"a.json","prefix":"x"}`,
+		`{"name":"a.json","auth_index":"x"}`,
+		`{"name":"a.json"," name ":"x"}`,
 	} {
 		if rec := scopedDo(engine, http.MethodPatch, "/v8/management/credentials/fields", key, body, local); rec.Code != http.StatusForbidden {
 			t.Fatalf("%s must be refused: %d", body, rec.Code)
@@ -172,5 +176,40 @@ func TestScopedKeyRefreshHidesCredential(t *testing.T) {
 	}
 	if rec := scopedDo(engine, http.MethodGet, "/v8/management/credentials", "root-secret", "", "127.0.0.1:1"); !strings.Contains(rec.Body.String(), `"scoped":false`) {
 		t.Fatalf("a root request must not be marked: %s", rec.Body.String())
+	}
+}
+
+func TestScopedAPICallDoesNotFollowRedirects(t *testing.T) {
+	landed := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/elsewhere" {
+			landed = true
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	}))
+	defer upstream.Close()
+	h := &Handler{cfg: &config.Config{}, failedAttempts: make(map[string]*attemptInfo)}
+	call := func(scoped bool) int {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v8/management/requests/api-call", strings.NewReader(`{"method":"GET","url":"`+upstream.URL+`/start"}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		if scoped {
+			c.Set(scopedKeyContextKey, "test")
+		}
+		h.APICall(c)
+		var out struct {
+			StatusCode int `json:"status_code"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out.StatusCode
+	}
+	if got := call(true); got != http.StatusFound || landed {
+		t.Fatalf("scoped call followed the redirect: status %d, landed %v", got, landed)
+	}
+	if got := call(false); got != http.StatusOK || !landed {
+		t.Fatalf("root call should follow as before: status %d, landed %v", got, landed)
 	}
 }
