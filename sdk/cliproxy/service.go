@@ -6,6 +6,7 @@ package cliproxy
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
@@ -45,6 +46,10 @@ type Service struct {
 	configSequence         uint64
 	appliedRoutingState    *routingRuntimeState
 
+	// proxyPoolPublisher scopes connection-pool fencing to this service, so a reload
+	// here never retires config snapshots served by another service.
+	proxyPoolPublisher uint64
+
 	// configPath is the path to the configuration file.
 	configPath string
 
@@ -71,6 +76,9 @@ type Service struct {
 
 	// discoveryManager manages local network mDNS / DNS-SD service advertising.
 	discoveryManager *discoveryAdvertiserManager
+
+	// kvStoreManaged tracks whether this service instance owns local KVStore lifecycle.
+	kvStoreManaged atomic.Bool
 
 	// serverErr channel for server startup/shutdown errors.
 	serverErr chan error
@@ -132,6 +140,17 @@ type Service struct {
 	homePluginSyncFetch          func(context.Context, sdkpluginstore.PluginSyncRequest) (sdkpluginstore.PluginSyncResponse, error)
 	homePluginDeleteTask         func(context.Context, *config.Config, home.PluginTask) homeplugins.SyncReport
 	antigravityProbeWg           sync.WaitGroup
+	// antigravityContext is protected by cfgMu and owns background model probes.
+	antigravityContext       context.Context
+	antigravityProbeMu       sync.Mutex
+	antigravityAccountProbes map[string]map[*antigravityAccountProbe]struct{}
+	antigravityRefreshWake   chan struct{}
+	// antigravityRefreshPending is protected by antigravityProbeMu. Each entry
+	// owns one worker and at most one queued snapshot shared by all probe entry
+	// points. A nil value means the worker is running without a queued successor.
+	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
+	antigravityPersistPending map[string]*antigravityHintPersistRequest
+	antigravityPersistActive  map[string]*antigravityHintPersistRequest
 }
 
 // SetResultPolicy sets an execution result policy on the underlying core auth manager.
