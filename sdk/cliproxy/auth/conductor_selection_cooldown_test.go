@@ -813,3 +813,95 @@ func TestErrorWithCause_ErrorDirectFormat(t *testing.T) {
 		t.Fatalf("Error() = %q, want containing upstream error summary", got)
 	}
 }
+
+func usageLimitTestAuth(id, provider, model, body string, next time.Time) *Auth {
+	lastErr := &Error{Message: body, HTTPStatus: 429}
+	return &Auth{
+		ID:             id,
+		Provider:       provider,
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Status:         StatusError,
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				LastError:      lastErr,
+				Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next},
+				UpdatedAt:      time.Now(),
+			},
+		},
+	}
+}
+
+const (
+	testUsageLimitBody = `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`
+	testRateLimitBody  = `{"error":{"type":"rate_limit_exceeded","message":"slow down"}}`
+)
+
+func TestAvailableAuthsForRouteModel_LabelsUsageLimitOnlyWhenEveryCandidateIsLimited(t *testing.T) {
+	t.Parallel()
+
+	const routeModel = "gpt-6.1-sol"
+	now := time.Now()
+	for name, tc := range map[string]struct {
+		secondBody string
+		want       bool
+	}{
+		"all usage limited":     {testUsageLimitBody, true},
+		"one only rate limited": {testRateLimitBody, false},
+	} {
+		auths := []*Auth{
+			usageLimitTestAuth("codex-a", "codex", routeModel, testUsageLimitBody, now.Add(3*time.Hour)),
+			usageLimitTestAuth("codex-b", "codex", routeModel, tc.secondBody, now.Add(time.Minute)),
+		}
+		_, err := NewManager(nil, nil, nil).availableAuthsForRouteModel(auths, "codex", routeModel, now)
+		var cooldownErr *modelCooldownError
+		if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+			t.Fatalf("%s: error = %T (%v), want *modelCooldownError", name, err, err)
+		}
+		if cooldownErr.usageLimit != tc.want {
+			t.Fatalf("%s: usageLimit = %v, want %v", name, cooldownErr.usageLimit, tc.want)
+		}
+	}
+}
+
+func TestMixedUnavailableErrorLocked_LabelsUsageLimitOnlyWhenEveryCandidateIsLimited(t *testing.T) {
+	const routeModel = "gpt-6.1-sol-mixed-usage"
+	for name, tc := range map[string]struct {
+		secondBody string
+		want       bool
+	}{
+		"all usage limited":     {testUsageLimitBody, true},
+		"one only rate limited": {testRateLimitBody, false},
+	} {
+		now := time.Now()
+		registry.GetGlobalRegistry().RegisterClient("mixed-usage-codex", "codex", []*registry.ModelInfo{{ID: routeModel}})
+		registry.GetGlobalRegistry().RegisterClient("mixed-usage-other", "openai-compatibility", []*registry.ModelInfo{{ID: routeModel}})
+
+		manager := NewManager(nil, nil, nil)
+		for _, auth := range []*Auth{
+			usageLimitTestAuth("mixed-usage-codex", "codex", routeModel, testUsageLimitBody, now.Add(3*time.Hour)),
+			usageLimitTestAuth("mixed-usage-other", "openai-compatibility", routeModel, tc.secondBody, now.Add(time.Minute)),
+		} {
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("%s: Register(%s): %v", name, auth.ID, errRegister)
+			}
+		}
+		manager.syncScheduler()
+		manager.scheduler.mu.Lock()
+		err := manager.scheduler.mixedUnavailableErrorLocked([]string{"codex", "openai-compatibility"}, routeModel, nil)
+		manager.scheduler.mu.Unlock()
+		registry.GetGlobalRegistry().UnregisterClient("mixed-usage-codex")
+		registry.GetGlobalRegistry().UnregisterClient("mixed-usage-other")
+
+		var cooldownErr *modelCooldownError
+		if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+			t.Fatalf("%s: error = %T (%v), want *modelCooldownError", name, err, err)
+		}
+		if cooldownErr.usageLimit != tc.want {
+			t.Fatalf("%s: usageLimit = %v, want %v", name, cooldownErr.usageLimit, tc.want)
+		}
+	}
+}

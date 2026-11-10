@@ -682,6 +682,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	var latestAuthID string
 	var latestAuthErr error
 
+	var candidates []*Auth
 	for _, providerKey := range providers {
 		providerState := s.providers[providerKey]
 		if providerState == nil {
@@ -691,6 +692,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
+		candidates = append(candidates, shard.candidateAuthsLocked(predicate)...)
 		localTotal, localCooldownCount, localUnauthorizedCount, localEarliest := shard.availabilitySummaryLocked(predicate)
 		total += localTotal
 		cooldownCount += localCooldownCount
@@ -730,7 +732,9 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		return newModelCooldownErrorWithCause(model, "", resetIn, lastCandidateErr)
+		cooldownErr := newModelCooldownErrorWithCause(model, "", resetIn, lastCandidateErr)
+		cooldownErr.usageLimit = allUsageLimited(candidates, func(*Auth) string { return model })
+		return cooldownErr
 	}
 	if unauthorizedCount == total {
 		terminalCause := latestAuthErr
@@ -1475,7 +1479,9 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 		if resetIn < 0 {
 			resetIn = 0
 		}
-		return newModelCooldownErrorWithCause(model, providerForError, resetIn, lastCandidateErr)
+		cooldownErr := newModelCooldownErrorWithCause(model, providerForError, resetIn, lastCandidateErr)
+		cooldownErr.usageLimit = allUsageLimited(m.candidateAuthsLocked(predicate), func(*Auth) string { return model })
+		return cooldownErr
 	}
 	if unauthorizedCount == total {
 		terminalCause := authErr
@@ -1490,6 +1496,21 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 		}, terminalCause)
 	}
 	return newAuthUnavailableErrorWithCause(earliest, now, lastCandidateErr)
+}
+
+// candidateAuthsLocked returns the auths of the shard's entries that match predicate.
+func (m *modelScheduler) candidateAuthsLocked(predicate func(*scheduledAuth) bool) []*Auth {
+	if m == nil {
+		return nil
+	}
+	auths := make([]*Auth, 0, len(m.entries))
+	for _, entry := range m.entries {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		auths = append(auths, entry.auth)
+	}
+	return auths
 }
 
 func (m *modelScheduler) latestCandidateErrorWithTimeLocked(model string, predicate func(*scheduledAuth) bool) (error, time.Time, string) {

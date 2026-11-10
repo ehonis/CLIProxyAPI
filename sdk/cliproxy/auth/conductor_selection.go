@@ -909,7 +909,11 @@ func (m *Manager) availableAuthsForRouteModelForRequest(ctx context.Context, aut
 			if resetIn < 0 {
 				resetIn = 0
 			}
-			return nil, newModelCooldownErrorWithCause(routeModel, providerForError, resetIn, lastCandidateErr)
+			cooldownErr := newModelCooldownErrorWithCause(routeModel, providerForError, resetIn, lastCandidateErr)
+			cooldownErr.usageLimit = allUsageLimited(auths, func(candidate *Auth) string {
+				return m.selectionModelForAuth(candidate, routeModel)
+			})
+			return nil, cooldownErr
 		}
 		if unauthorizedCount == len(auths) && len(auths) > 0 {
 			terminalCause := latestUnauthorizedCandidateError(auths)
@@ -1024,7 +1028,10 @@ func restoreModelCooldownErrorModel(err error, requestedModel string) error {
 	if !errors.As(err, &cooldownErr) || cooldownErr == nil || cooldownErr.model != "" {
 		return err
 	}
-	return newModelCooldownErrorWithCause(requestedModel, cooldownErr.provider, cooldownErr.resetIn, cooldownErr.cause)
+	restored := newModelCooldownErrorWithCause(requestedModel, cooldownErr.provider, cooldownErr.resetIn, cooldownErr.cause)
+	restored.resetAt = cooldownErr.resetAt
+	restored.usageLimit = cooldownErr.usageLimit
+	return restored
 }
 
 func latestUnauthorizedCandidateError(auths []*Auth) error {
