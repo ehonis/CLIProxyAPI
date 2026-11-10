@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -85,8 +86,12 @@ const (
 type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
+	resetAt  time.Time
 	provider string
 	cause    error
+	// usageLimit is set when every cooling candidate is blocked by a Codex
+	// usage_limit_reached, so no credential can recover before resetAt.
+	usageLimit bool
 }
 
 // NewModelCooldownError creates an error representing model-level cooldown.
@@ -106,6 +111,7 @@ func newModelCooldownErrorWithCause(model, provider string, resetIn time.Duratio
 		model:    model,
 		provider: provider,
 		resetIn:  resetIn,
+		resetAt:  time.Now().Add(resetIn),
 		cause:    cause,
 	}
 }
@@ -157,6 +163,14 @@ func (e *modelCooldownError) Error() string {
 			errorBody["message"] = message
 		}
 	}
+	// Codex clients fail a turn on a 429 only when error.type is
+	// usage_limit_reached; any other 429 is retried after Retry-After, which for
+	// a quota cooldown leaves the turn sleeping for hours.
+	if e.usageLimit {
+		errorBody["type"] = "usage_limit_reached"
+		errorBody["resets_in_seconds"] = resetSeconds
+		errorBody["resets_at"] = e.resetAt.Unix()
+	}
 	payload := map[string]any{"error": errorBody}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -186,6 +200,64 @@ var (
 	sanitizerWindowsPathPattern            = regexp.MustCompile(`(?i)\b[A-Za-z]:\\[^\r\n:,;'"<>]+`)
 	sanitizerWindowsUNCPathPattern         = regexp.MustCompile(`\\\\[^\r\n:,;'"<>]+\\[^\r\n:,;'"<>]+`)
 )
+
+// allUsageLimited reports whether every candidate's cooldown cause for its model
+// is a Codex usage_limit_reached. One candidate cooling for another reason (a
+// short rate limit, say) may recover first, so the cooldown stays retryable.
+func allUsageLimited(auths []*Auth, modelFor func(*Auth) string) bool {
+	seen := false
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if !isUsageLimitError(cooldownCauseForModel(auth, modelFor(auth))) {
+			return false
+		}
+		seen = true
+	}
+	return seen
+}
+
+// cooldownCauseForModel returns the error behind a candidate's block for model.
+// A model blocked by a credential-wide quota keeps its own older LastError, so
+// the credential's error is the cause there.
+func cooldownCauseForModel(auth *Auth, model string) error {
+	if state := existingModelState(auth, model); state != nil && state.Quota.Reason != "credential_quota" {
+		if state.LastError != nil {
+			return state.LastError
+		}
+		if msg := strings.TrimSpace(state.StatusMessage); msg != "" {
+			return errors.New(msg)
+		}
+	}
+	if auth.LastError != nil {
+		return auth.LastError
+	}
+	if msg := strings.TrimSpace(auth.StatusMessage); msg != "" {
+		return errors.New(msg)
+	}
+	return nil
+}
+
+func isUsageLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.TrimSpace(err.Error())
+	if idx := strings.Index(raw, ": {"); idx != -1 && idx < 50 {
+		raw = strings.TrimSpace(raw[idx+2:])
+	}
+	if !ojson.Valid(raw) {
+		return false
+	}
+	parsed := ojson.Parse(raw)
+	for _, path := range []string{"error.type", "type", "body.error.type"} {
+		if strings.EqualFold(strings.TrimSpace(parsed.Get(path).String()), "usage_limit_reached") {
+			return true
+		}
+	}
+	return false
+}
 
 // ExtractUpstreamErrorSummary extracts and sanitizes a concise error summary from upstream error strings.
 func ExtractUpstreamErrorSummary(raw string) string {

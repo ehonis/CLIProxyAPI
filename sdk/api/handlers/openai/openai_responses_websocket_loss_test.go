@@ -1092,6 +1092,12 @@ func TestResponsesWebsocketTerminal429WhenAllCredentialsExhaustedOrCooling(t *te
 	if got := int(ojson.GetBytesNoCopy(frame3, "error.reset_seconds").Int()); got <= 0 {
 		t.Fatalf("frame3 error.reset_seconds = %d, want > 0: %s", got, frame3)
 	}
+	if got := ojson.GetBytesNoCopy(frame3, "error.type").String(); got != "usage_limit_reached" {
+		t.Fatalf("frame3 error.type = %q, want usage_limit_reached so Codex fails the turn: %s", got, frame3)
+	}
+	if got := int(ojson.GetBytesNoCopy(frame3, "error.resets_in_seconds").Int()); got <= 0 {
+		t.Fatalf("frame3 error.resets_in_seconds = %d, want > 0: %s", got, frame3)
+	}
 	if got := ojson.GetBytesNoCopy(frame3, "headers.Retry-After").String(); got == "" {
 		t.Fatalf("frame3 headers.Retry-After is empty: %s", frame3)
 	}

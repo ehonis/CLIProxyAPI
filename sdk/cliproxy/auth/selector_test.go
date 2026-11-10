@@ -2698,3 +2698,95 @@ func TestExtractExplicitSessionIDs_EnhancedHarnesses(t *testing.T) {
 		t.Fatalf("subagent did not inherit parent task credential: got %s, want %s", subagentAuth.ID, parentAuth.ID)
 	}
 }
+
+func TestModelCooldownErrorLabelsCodexUsageLimit(t *testing.T) {
+	t.Parallel()
+
+	decode := func(t *testing.T, err error) map[string]any {
+		t.Helper()
+		var payload map[string]any
+		if errJSON := json.Unmarshal([]byte(err.Error()), &payload); errJSON != nil {
+			t.Fatalf("json.Unmarshal(Error()) error = %v", errJSON)
+		}
+		rawErr, ok := payload["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("Error() payload missing error object: %v", payload)
+		}
+		return rawErr
+	}
+
+	before := time.Now()
+	labeled := newModelCooldownErrorWithCause("gpt-6.1-sol", "codex", 3*time.Hour, nil)
+	labeled.usageLimit = true
+	rawErr := decode(t, labeled)
+	if got, _ := rawErr["code"].(string); got != "model_cooldown" {
+		t.Fatalf("error.code = %q, want model_cooldown", got)
+	}
+	if got, _ := rawErr["type"].(string); got != "usage_limit_reached" {
+		t.Fatalf("error.type = %q, want usage_limit_reached", got)
+	}
+	if got, _ := rawErr["resets_in_seconds"].(float64); int(got) != 3*60*60 {
+		t.Fatalf("error.resets_in_seconds = %v, want %d", got, 3*60*60)
+	}
+	resetsAt, _ := rawErr["resets_at"].(float64)
+	if want := before.Add(3 * time.Hour).Unix(); int64(resetsAt) < want || int64(resetsAt) > want+5 {
+		t.Fatalf("error.resets_at = %v, want about %d", resetsAt, want)
+	}
+
+	restored := restoreModelCooldownErrorModel(newModelCooldownErrorWithCause("", "codex", time.Hour, nil), "gpt-6.1-sol")
+	if mce, ok := restored.(*modelCooldownError); !ok || mce.usageLimit {
+		t.Fatalf("restored unlabeled error = %#v, want unlabeled *modelCooldownError", restored)
+	}
+	restored = restoreModelCooldownErrorModel(&modelCooldownError{resetIn: time.Hour, resetAt: before.Add(time.Hour), usageLimit: true}, "gpt-6.1-sol")
+	if mce, ok := restored.(*modelCooldownError); !ok || !mce.usageLimit || !mce.resetAt.Equal(before.Add(time.Hour)) {
+		t.Fatalf("restored labeled error = %#v, want usageLimit and resetAt kept", restored)
+	}
+
+	plain := decode(t, newModelCooldownErrorWithCause("gpt-6.1-sol", "codex", time.Minute, errors.New(`{"error":{"type":"usage_limit_reached"}}`)))
+	for _, field := range []string{"type", "resets_in_seconds", "resets_at"} {
+		if _, ok := plain[field]; ok {
+			t.Fatalf("unlabeled error has %s = %v, want absent", field, plain[field])
+		}
+	}
+}
+
+func TestAllUsageLimited(t *testing.T) {
+	t.Parallel()
+
+	const model = "gpt-6.1-sol"
+	usageBody := `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":600}}`
+	usageErr := &Error{HTTPStatus: http.StatusTooManyRequests, Message: usageBody}
+	rateErr := &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"error":{"type":"rate_limit_exceeded","message":"slow down"}}`}
+	staleErr := &Error{HTTPStatus: http.StatusInternalServerError, Message: `{"error":{"type":"server_error","message":"boom"}}`}
+	withModelErr := func(id string, err *Error, reason string) *Auth {
+		return &Auth{ID: id, ModelStates: map[string]*ModelState{
+			model: {LastError: err, Quota: QuotaState{Exceeded: true, Reason: reason}},
+		}}
+	}
+	modelFor := func(*Auth) string { return model }
+
+	cases := []struct {
+		name  string
+		auths []*Auth
+		want  bool
+	}{
+		{"single usage limit", []*Auth{withModelErr("a", usageErr, "quota")}, true},
+		{"coded error wraps the body", []*Auth{withModelErr("a", &Error{Code: "credential_quota", Message: usageBody}, "quota")}, true},
+		{"status message only", []*Auth{{ID: "a", ModelStates: map[string]*ModelState{model: {StatusMessage: usageBody}}}}, true},
+		{"every candidate usage limited", []*Auth{withModelErr("a", usageErr, "quota"), withModelErr("b", usageErr, "quota")}, true},
+		{"one candidate only rate limited", []*Auth{withModelErr("a", usageErr, "quota"), withModelErr("b", rateErr, "quota")}, false},
+		{"credential quota uses the credential error", []*Auth{{ID: "a", LastError: usageErr, ModelStates: map[string]*ModelState{
+			model: {LastError: staleErr, Quota: QuotaState{Exceeded: true, Reason: "credential_quota"}},
+		}}}, true},
+		{"own block uses the model error", []*Auth{{ID: "a", LastError: usageErr, ModelStates: map[string]*ModelState{
+			model: {LastError: rateErr, Quota: QuotaState{Exceeded: true, Reason: "quota"}},
+		}}}, false},
+		{"plain text is not a usage limit", []*Auth{withModelErr("a", &Error{Message: "usage_limit_reached somewhere in prose"}, "quota")}, false},
+		{"no candidates", nil, false},
+	}
+	for _, tc := range cases {
+		if got := allUsageLimited(tc.auths, modelFor); got != tc.want {
+			t.Errorf("%s: allUsageLimited() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

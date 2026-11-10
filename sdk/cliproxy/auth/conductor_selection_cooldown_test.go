@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -811,5 +812,133 @@ func TestErrorWithCause_ErrorDirectFormat(t *testing.T) {
 	}
 	if !strings.Contains(got, "server_is_overloaded") || !strings.Contains(got, "Our servers are currently overloaded. Please try again later.") {
 		t.Fatalf("Error() = %q, want containing upstream error summary", got)
+	}
+}
+
+func usageLimitTestAuth(id, provider, model, body string, next time.Time) *Auth {
+	lastErr := &Error{Message: body, HTTPStatus: 429}
+	return &Auth{
+		ID:             id,
+		Provider:       provider,
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Status:         StatusError,
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				LastError:      lastErr,
+				Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next},
+				UpdatedAt:      time.Now(),
+			},
+		},
+	}
+}
+
+const (
+	testUsageLimitBody = `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`
+	testRateLimitBody  = `{"error":{"type":"rate_limit_exceeded","message":"slow down"}}`
+)
+
+func TestAvailableAuthsForRouteModel_LabelsUsageLimitOnlyWhenEveryCandidateIsLimited(t *testing.T) {
+	t.Parallel()
+
+	const routeModel = "gpt-6.1-sol"
+	now := time.Now()
+	for name, tc := range map[string]struct {
+		secondBody string
+		want       bool
+	}{
+		"all usage limited":     {testUsageLimitBody, true},
+		"one only rate limited": {testRateLimitBody, false},
+	} {
+		auths := []*Auth{
+			usageLimitTestAuth("codex-a", "codex", routeModel, testUsageLimitBody, now.Add(3*time.Hour)),
+			usageLimitTestAuth("codex-b", "codex", routeModel, tc.secondBody, now.Add(time.Minute)),
+		}
+		_, err := NewManager(nil, nil, nil).availableAuthsForRouteModel(auths, "codex", routeModel, now)
+		var cooldownErr *modelCooldownError
+		if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+			t.Fatalf("%s: error = %T (%v), want *modelCooldownError", name, err, err)
+		}
+		if cooldownErr.usageLimit != tc.want {
+			t.Fatalf("%s: usageLimit = %v, want %v", name, cooldownErr.usageLimit, tc.want)
+		}
+	}
+}
+
+func TestMixedUnavailableErrorLocked_LabelsUsageLimitOnlyWhenEveryCandidateIsLimited(t *testing.T) {
+	const routeModel = "gpt-6.1-sol-mixed-usage"
+	for name, tc := range map[string]struct {
+		secondBody string
+		want       bool
+	}{
+		"all usage limited":     {testUsageLimitBody, true},
+		"one only rate limited": {testRateLimitBody, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now()
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient("mixed-usage-codex", "codex", []*registry.ModelInfo{{ID: routeModel}})
+			reg.RegisterClient("mixed-usage-other", "openai-compatibility", []*registry.ModelInfo{{ID: routeModel}})
+			t.Cleanup(func() {
+				reg.UnregisterClient("mixed-usage-codex")
+				reg.UnregisterClient("mixed-usage-other")
+			})
+
+			manager := NewManager(nil, nil, nil)
+			for _, auth := range []*Auth{
+				usageLimitTestAuth("mixed-usage-codex", "codex", routeModel, testUsageLimitBody, now.Add(3*time.Hour)),
+				usageLimitTestAuth("mixed-usage-other", "openai-compatibility", routeModel, tc.secondBody, now.Add(time.Minute)),
+			} {
+				if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+					t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+				}
+			}
+			manager.syncScheduler()
+			manager.scheduler.mu.Lock()
+			err := manager.scheduler.mixedUnavailableErrorLocked([]string{"codex", "openai-compatibility"}, routeModel, nil)
+			manager.scheduler.mu.Unlock()
+
+			var cooldownErr *modelCooldownError
+			if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+				t.Fatalf("error = %T (%v), want *modelCooldownError", err, err)
+			}
+			if cooldownErr.usageLimit != tc.want {
+				t.Fatalf("usageLimit = %v, want %v", cooldownErr.usageLimit, tc.want)
+			}
+		})
+	}
+}
+
+// A credential-scoped usage limit on one model blocks its siblings, which keep
+// their own older LastError; the sibling's cooldown must still be labelled.
+func TestMarkResult_CredentialScopedUsageLimitLabelsSiblingCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	m, auth := newCooldownMonotonicManager(t, "usage-sibling-a", "usage-sibling-b")
+	ctx := context.Background()
+	m.MarkResult(ctx, Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "usage-sibling-b",
+		Error: &Error{HTTPStatus: http.StatusInternalServerError, Message: `{"error":{"type":"server_error","message":"boom"}}`},
+	})
+	resetIn := 3 * time.Hour
+	m.MarkResult(ctx, Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "usage-sibling-a",
+		RetryAfter: &resetIn, CredentialScope: true,
+		Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: testUsageLimitBody},
+	})
+
+	snapshot, _ := m.GetByID(auth.ID)
+	_, err := m.availableAuthsForRouteModel([]*Auth{snapshot}, auth.Provider, "usage-sibling-b", time.Now())
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+		t.Fatalf("sibling error = %T (%v), want *modelCooldownError", err, err)
+	}
+	if !cooldownErr.usageLimit {
+		t.Fatalf("sibling cooldown usageLimit = false, want true (cause %v)", cooldownErr.cause)
 	}
 }
