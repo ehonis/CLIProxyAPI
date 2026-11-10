@@ -2698,3 +2698,60 @@ func TestExtractExplicitSessionIDs_EnhancedHarnesses(t *testing.T) {
 		t.Fatalf("subagent did not inherit parent task credential: got %s, want %s", subagentAuth.ID, parentAuth.ID)
 	}
 }
+
+func TestModelCooldownErrorLabelsCodexUsageLimit(t *testing.T) {
+	t.Parallel()
+
+	decode := func(t *testing.T, err error) map[string]any {
+		t.Helper()
+		var payload map[string]any
+		if errJSON := json.Unmarshal([]byte(err.Error()), &payload); errJSON != nil {
+			t.Fatalf("json.Unmarshal(Error()) error = %v", errJSON)
+		}
+		rawErr, ok := payload["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("Error() payload missing error object: %v", payload)
+		}
+		return rawErr
+	}
+
+	t.Run("usage limit cause is labeled usage_limit_reached", func(t *testing.T) {
+		t.Parallel()
+
+		cause := errors.New(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":600}}`)
+		before := time.Now()
+		rawErr := decode(t, newModelCooldownErrorWithCause("gpt-6.1-sol", "codex", 3*time.Hour, cause))
+
+		if got, _ := rawErr["code"].(string); got != "model_cooldown" {
+			t.Fatalf("error.code = %q, want model_cooldown", got)
+		}
+		if got, _ := rawErr["type"].(string); got != "usage_limit_reached" {
+			t.Fatalf("error.type = %q, want usage_limit_reached", got)
+		}
+		if got, _ := rawErr["resets_in_seconds"].(float64); int(got) != 3*60*60 {
+			t.Fatalf("error.resets_in_seconds = %v, want %d", got, 3*60*60)
+		}
+		resetsAt, _ := rawErr["resets_at"].(float64)
+		if want := before.Add(3 * time.Hour).Unix(); int64(resetsAt) < want || int64(resetsAt) > want+5 {
+			t.Fatalf("error.resets_at = %v, want about %d", resetsAt, want)
+		}
+	})
+
+	t.Run("other causes stay retryable", func(t *testing.T) {
+		t.Parallel()
+
+		for name, cause := range map[string]error{
+			"rate limit": errors.New(`{"error":{"type":"rate_limit_exceeded","message":"slow down"}}`),
+			"no cause":   nil,
+			"plain text": errors.New("usage_limit_reached somewhere in prose"),
+		} {
+			rawErr := decode(t, newModelCooldownErrorWithCause("gpt-6.1-sol", "codex", time.Minute, cause))
+			if _, ok := rawErr["type"]; ok {
+				t.Fatalf("%s: error.type = %v, want absent", name, rawErr["type"])
+			}
+			if _, ok := rawErr["resets_in_seconds"]; ok {
+				t.Fatalf("%s: error.resets_in_seconds present, want absent", name)
+			}
+		}
+	})
+}

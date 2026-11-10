@@ -85,6 +85,7 @@ const (
 type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
+	resetAt  time.Time
 	provider string
 	cause    error
 }
@@ -106,6 +107,7 @@ func newModelCooldownErrorWithCause(model, provider string, resetIn time.Duratio
 		model:    model,
 		provider: provider,
 		resetIn:  resetIn,
+		resetAt:  time.Now().Add(resetIn),
 		cause:    cause,
 	}
 }
@@ -156,6 +158,16 @@ func (e *modelCooldownError) Error() string {
 			message += fmt.Sprintf(" (last error: %s)", causeText)
 			errorBody["message"] = message
 		}
+		// Codex clients fail a turn on a 429 only when error.type is
+		// usage_limit_reached; any other 429 is retried after Retry-After, which for
+		// a quota cooldown leaves the turn sleeping for hours.
+		if isUsageLimitCause(e.cause) {
+			errorBody["type"] = "usage_limit_reached"
+			errorBody["resets_in_seconds"] = resetSeconds
+			if !e.resetAt.IsZero() {
+				errorBody["resets_at"] = e.resetAt.Unix()
+			}
+		}
 	}
 	payload := map[string]any{"error": errorBody}
 	data, err := json.Marshal(payload)
@@ -186,6 +198,26 @@ var (
 	sanitizerWindowsPathPattern            = regexp.MustCompile(`(?i)\b[A-Za-z]:\\[^\r\n:,;'"<>]+`)
 	sanitizerWindowsUNCPathPattern         = regexp.MustCompile(`\\\\[^\r\n:,;'"<>]+\\[^\r\n:,;'"<>]+`)
 )
+
+func isUsageLimitCause(cause error) bool {
+	if cause == nil {
+		return false
+	}
+	raw := strings.TrimSpace(cause.Error())
+	if idx := strings.Index(raw, ": {"); idx != -1 && idx < 50 {
+		raw = strings.TrimSpace(raw[idx+2:])
+	}
+	if !ojson.Valid(raw) {
+		return false
+	}
+	parsed := ojson.Parse(raw)
+	for _, path := range []string{"error.type", "type", "body.error.type"} {
+		if strings.EqualFold(strings.TrimSpace(parsed.Get(path).String()), "usage_limit_reached") {
+			return true
+		}
+	}
+	return false
+}
 
 // ExtractUpstreamErrorSummary extracts and sanitizes a concise error summary from upstream error strings.
 func ExtractUpstreamErrorSummary(raw string) string {
