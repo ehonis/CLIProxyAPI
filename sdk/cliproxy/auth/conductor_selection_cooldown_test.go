@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -876,32 +877,68 @@ func TestMixedUnavailableErrorLocked_LabelsUsageLimitOnlyWhenEveryCandidateIsLim
 		"all usage limited":     {testUsageLimitBody, true},
 		"one only rate limited": {testRateLimitBody, false},
 	} {
-		now := time.Now()
-		registry.GetGlobalRegistry().RegisterClient("mixed-usage-codex", "codex", []*registry.ModelInfo{{ID: routeModel}})
-		registry.GetGlobalRegistry().RegisterClient("mixed-usage-other", "openai-compatibility", []*registry.ModelInfo{{ID: routeModel}})
+		t.Run(name, func(t *testing.T) {
+			now := time.Now()
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient("mixed-usage-codex", "codex", []*registry.ModelInfo{{ID: routeModel}})
+			reg.RegisterClient("mixed-usage-other", "openai-compatibility", []*registry.ModelInfo{{ID: routeModel}})
+			t.Cleanup(func() {
+				reg.UnregisterClient("mixed-usage-codex")
+				reg.UnregisterClient("mixed-usage-other")
+			})
 
-		manager := NewManager(nil, nil, nil)
-		for _, auth := range []*Auth{
-			usageLimitTestAuth("mixed-usage-codex", "codex", routeModel, testUsageLimitBody, now.Add(3*time.Hour)),
-			usageLimitTestAuth("mixed-usage-other", "openai-compatibility", routeModel, tc.secondBody, now.Add(time.Minute)),
-		} {
-			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-				t.Fatalf("%s: Register(%s): %v", name, auth.ID, errRegister)
+			manager := NewManager(nil, nil, nil)
+			for _, auth := range []*Auth{
+				usageLimitTestAuth("mixed-usage-codex", "codex", routeModel, testUsageLimitBody, now.Add(3*time.Hour)),
+				usageLimitTestAuth("mixed-usage-other", "openai-compatibility", routeModel, tc.secondBody, now.Add(time.Minute)),
+			} {
+				if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+					t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+				}
 			}
-		}
-		manager.syncScheduler()
-		manager.scheduler.mu.Lock()
-		err := manager.scheduler.mixedUnavailableErrorLocked([]string{"codex", "openai-compatibility"}, routeModel, nil)
-		manager.scheduler.mu.Unlock()
-		registry.GetGlobalRegistry().UnregisterClient("mixed-usage-codex")
-		registry.GetGlobalRegistry().UnregisterClient("mixed-usage-other")
+			manager.syncScheduler()
+			manager.scheduler.mu.Lock()
+			err := manager.scheduler.mixedUnavailableErrorLocked([]string{"codex", "openai-compatibility"}, routeModel, nil)
+			manager.scheduler.mu.Unlock()
 
-		var cooldownErr *modelCooldownError
-		if !errors.As(err, &cooldownErr) || cooldownErr == nil {
-			t.Fatalf("%s: error = %T (%v), want *modelCooldownError", name, err, err)
-		}
-		if cooldownErr.usageLimit != tc.want {
-			t.Fatalf("%s: usageLimit = %v, want %v", name, cooldownErr.usageLimit, tc.want)
-		}
+			var cooldownErr *modelCooldownError
+			if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+				t.Fatalf("error = %T (%v), want *modelCooldownError", err, err)
+			}
+			if cooldownErr.usageLimit != tc.want {
+				t.Fatalf("usageLimit = %v, want %v", cooldownErr.usageLimit, tc.want)
+			}
+		})
+	}
+}
+
+// A credential-scoped usage limit on one model blocks its siblings, which keep
+// their own older LastError; the sibling's cooldown must still be labelled.
+func TestMarkResult_CredentialScopedUsageLimitLabelsSiblingCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	m, auth := newCooldownMonotonicManager(t, "usage-sibling-a", "usage-sibling-b")
+	ctx := context.Background()
+	m.MarkResult(ctx, Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "usage-sibling-b",
+		Error: &Error{HTTPStatus: http.StatusInternalServerError, Message: `{"error":{"type":"server_error","message":"boom"}}`},
+	})
+	resetIn := 3 * time.Hour
+	m.MarkResult(ctx, Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "usage-sibling-a",
+		RetryAfter: &resetIn, CredentialScope: true,
+		Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: testUsageLimitBody},
+	})
+
+	snapshot, _ := m.GetByID(auth.ID)
+	_, err := m.availableAuthsForRouteModel([]*Auth{snapshot}, auth.Provider, "usage-sibling-b", time.Now())
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) || cooldownErr == nil {
+		t.Fatalf("sibling error = %T (%v), want *modelCooldownError", err, err)
+	}
+	if !cooldownErr.usageLimit {
+		t.Fatalf("sibling cooldown usageLimit = false, want true (cause %v)", cooldownErr.cause)
 	}
 }
